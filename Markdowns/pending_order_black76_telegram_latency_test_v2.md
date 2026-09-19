@@ -10,7 +10,7 @@ places or cancels an order.**
 
 ---
 
-## STATUS — built 19 Sep 2026, market-closed half verified. Awaiting Mon 21 Sep.
+## STATUS — built + connectivity check added 19 Sep 2026. Awaiting Mon 21 Sep.
 
 `black76.py`, `test_black76.py` (16 passing), `bench_latency.py` all written.
 No existing file touched. `bench_latency.py` confirmed absent from
@@ -30,6 +30,57 @@ payload**, because the market was closed while this was built. If Monday's
 run shows `order_id`/`order_timestamp`/`status` under different keys, that
 function is the one to fix. This is the one open risk in an otherwise
 verified implementation.
+
+### What today's session-with-a-closed-market added
+
+1. **`check-ws` — a new subcommand, no market-hours gate.** The original
+   `run_mode_b()` refused to run at all on a closed day, which meant the
+   "start the websocket and confirm it connects" promise below (**Running
+   it: Today**) was not actually deliverable by the code as first written.
+   `check_ws_connectivity()` connects, waits up to 10s for `on_connect` /
+   `on_error`, reports which, and disconnects — no order listening, no
+   Telegram, nothing that can place or cancel anything. Verified against a
+   faked ticker (both the connect and the error path); the real handshake
+   is still unverified pending a live session (next point).
+2. **A fresh LOCAL Kite login is needed before ANY of this touches real
+   data — independent of market hours.** `bench_latency.py` authenticates
+   through `kite_auth.try_cached_session()`, which reads the same
+   `.kite_session_cache.json` `token_helper.py` / `/login` write — a
+   completely separate session from any other Kite connector that might be
+   logged in elsewhere. Kite tokens expire daily regardless of whether the
+   market opens, so **Mode A and `check-ws` both need that fresh login
+   first, every day**, not just today.
+3. **Kite accepts an order request on a closed-market day** — it does not
+   reject it. A regular/limit order placed outside market hours is
+   auto-converted to an AMO and comes back with status `AMO REQ RECEIVED`.
+   That status means the request is queued, **not yet on the exchange** —
+   Kite pushes AMO requests to NSE in the pre-open window (roughly
+   09:00–09:08 IST) ahead of the next session's open. Confirmed against a
+   live order book today (order details deliberately not reproduced here —
+   see the redaction note in the repo's `.gitignore`).
+
+   **This changes what Monday should watch for.** An AMO placed today
+   converting to a live exchange order during Monday's pre-open is a
+   second, independent detection event — distinct from a fresh order
+   placed from the phone during the regular session — and it is worth
+   checking `on_order_update` against *both* transitions, not just the
+   second one.
+4. **Order timestamp format is not uniform across Kite API surfaces.**
+   Confirmed today: the REST `orders()` call through the `kiteconnect`
+   Python SDK returns a naive, second-resolution `datetime` (via the SDK's
+   own parser, matching the ±1s bracket already documented under
+   **Timing**); at least one other Kite API surface returns a full
+   ISO-8601 string with a timezone offset for the same field. This doesn't
+   resolve the open risk above about the websocket postback's exact
+   shape — if anything it reinforces it. **On Monday, have
+   `_parse_order_timestamp()` print the raw value on first sight**, so a
+   format mismatch is visible immediately rather than silently returning
+   `None` and being mistaken for "never fired."
+5. **Fixed while adding `check-ws`:** `main()` was requiring
+   `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` unconditionally, even for Mode
+   B, which never sends anything to Telegram. Only Mode A is gated on
+   Telegram config now — a bare detection or connectivity test no longer
+   needs Telegram configured at all.
 
 Rev 3 supersedes rev 2's Mode B, which was not buildable: it assumed a
 detection mechanism that exists nowhere in the repo.
@@ -107,7 +158,19 @@ A stale or zero LTP with the market shut will not bracket for IV inversion.
 **A failed solve still records its timings** rather than aborting the
 iteration — this measures latency, not pricing.
 
-### Mode B — Detection latency (market open only, phone-placed)
+### Mode B, part 1 — connectivity check (works today, no market hours)
+
+`python bench_latency.py check-ws` — connects the websocket, waits up to
+10s for `on_connect` or `on_error`, reports which, disconnects. No order
+listening, no Telegram, no market-hours gate. Needs only a fresh local Kite
+login (see STATUS above — that login itself needs no market hours either).
+
+This is the one piece of Mode B genuinely testable before Monday: it proves
+the `api_key` / `access_token` / websocket handshake all work. It does
+**not** prove `on_order_update` fires for a real order — that is exactly
+what part 2 still needs market hours for.
+
+### Mode B, part 2 — Detection latency (market open only, phone-placed)
 
 Two listeners run together, both stamping arrival on the local monotonic
 clock:
@@ -302,25 +365,52 @@ orders, or dropping auto-activation in favour of a manual trigger.
 
 ---
 
-## Running it
+## Running it — what's actually testable, and when
 
-**Today (market closed):** build; run Mode A end to end against last-close
-data; start the websocket and confirm it connects and the callback is
-registered. The firing half stays unproven until Monday.
+Three tiers, not two. The dividing line is NOT just market hours — a fresh
+local Kite login gates two of the three tiers on its own, every day,
+regardless of whether the market is open.
 
-**Mon 21 Sep, 09:15 IST:** needs a valid Kite session first — `/login` via the
-Telegram poller, or `token_helper.py`. Then run, place a few orders from the
-phone, read the report.
+**Tier 1 — right now, no login at all:**
+```
+python -m pytest test_black76.py -q
+```
+Pure math, 16 tests, no Kite, no network. Already passing.
+
+**Tier 2 — today, but only AFTER a fresh local login** (`/login` via the
+Telegram poller, or `python3 token_helper.py` — works any day, this is the
+same daily Kite expiry every login flow deals with, nothing today-specific):
+```
+python bench_latency.py check-ws        # proves the handshake works
+python bench_latency.py mode-a          # real last-close data, real Telegram sends
+```
+Both need only a valid session — neither needs market hours. If the local
+`.kite_session_cache.json` is stale (check its `date` field against today),
+this is the blocking step; nothing below it runs without it.
+
+**Tier 3 — Mon 21 Sep, 09:15 IST, market open:**
+```
+python bench_latency.py mode-b
+```
+Needs the same fresh login as Tier 2, plus the market actually open. Two
+things to watch for, not one — see STATUS point 3: whichever AMO is sitting
+in the order book converting during pre-open (~09:00–09:08 IST), and a fresh
+order placed from the phone during the regular session. Both are legitimate
+`on_order_update` tests; capture whichever comes first.
 
 ## Verification
 
 1. `python -m pytest -q` — collection unchanged; `bench_latency.py` not picked
-   up, `test_black76.py` passes.
-2. Mode A, market closed — completes, prints per-stage stats, and a failed IV
-   solve still reports timings.
-3. `python -c "from engine import engine_version; print(engine_version())"` —
-   unchanged; this touches no hashed module.
-4. Monday: the binary result — did `on_order_update` fire for a phone-placed
-   order, yes or no.
-5. Cross-check one order's `order_timestamp` against the Kite order book by
-   eye, to confirm the bracket is computed the right way round.
+   up, `test_black76.py` passes. Needs no login, works right now.
+2. `python -c "from engine import engine_version; print(engine_version())"` —
+   unchanged; this touches no hashed module. Needs no login either.
+3. After a fresh local login: `python bench_latency.py check-ws` reports
+   `[ws] CONNECTED`, not a timeout or an auth error.
+4. After a fresh local login: Mode A completes, prints per-stage stats, and a
+   failed IV solve still reports timings rather than aborting.
+5. Monday: the binary result — did `on_order_update` fire at all, for either
+   the AMO's pre-open conversion or a fresh phone order.
+6. Cross-check one order's `order_timestamp` against the Kite order book by
+   eye, to confirm the bracket is computed the right way round — and check
+   what `_parse_order_timestamp()` printed for the raw value (STATUS point
+   4), since the exact format was unverified going into Monday.
