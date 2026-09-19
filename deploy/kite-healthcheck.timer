@@ -1,0 +1,21 @@
+; kite-healthcheck.timer — fire the probe every 5 minutes.
+;
+; Enable with:  systemctl --user enable --now kite-healthcheck.timer
+; Inspect with: systemctl --user list-timers kite-healthcheck.timer
+
+[Unit]
+Description=Run the Bank Nifty scanner health probe every 5 minutes
+
+[Timer]
+; Wall-clock aligned rather than OnUnitActiveSec, so firing times are
+; predictable when correlating against csv/ and journal timestamps.
+OnCalendar=*:0/5
+; Survive the VM being asleep or the timer being enabled mid-interval.
+Persistent=true
+; Spread load off the exact minute boundary — the scanner writes on its own
+; 30s cadence and there is no reason to collide with it.
+RandomizedDelaySec=20
+Unit=kite-healthcheck.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+.kite_session_cache.json
+
+# Generated output — csv/ and latest_volume_profile.json are deliberately NOT
+# ignored: logs, caches and golden fixtures are kept locally as the evidence
+# base that policy is scored against.
+# Pre-move paths — kept so an older checkout can't commit a stray log. Leading
+# slash is load-bearing: unanchored, these match at ANY depth and would silently
+# re-ignore csv/alert_log.csv and csv/signal_log.csv.
+/volume_profile_log.csv
+/alert_log.csv
+/alert_log.csv.bak
+/signal_log.csv
+
+# Dry-run output (BN_DRY_RUN=1). Disposable by construction — a dry run writes
+# nothing outside this directory — and never evidence, so unlike csv/ it IS
+# ignored. Also excluded from sync.sh already, which copies *.py only.
+csv-dryrun/
+
+# VS Code (keep launch.json/settings.json, ignore local overrides)
+.vscode/*.local.json
+
+# Test cache — no secrets, just churn; same reasoning as __pycache__ above.
+.pytest_cache/
+
+# Docs that name the live VM directly — external IP, SSH username, GCE
+# instance name, or a personal Telegram chat ID. None of it is a credential
+# (the IP is ephemeral and rotates on stop/start; the chat ID is meaningless
+# without the bot token, which is already gitignored above), but together
+# they're a map to a real, currently-live box, and a repo is forever even if
+# a file is deleted from it later. Excluded rather than redacted — these are
+# handover/runbook notes whose whole value IS the concrete values, so a
+# placeholder version would stop being useful as documentation. Kept locally;
+# regenerate a redacted equivalent if this project is ever handed to someone
+# else.
+/Markdowns/vm_handover.md
+/Markdowns/deployment_runbook.md
+/Markdowns/session_state_05sep.md
+/Markdowns/bn_linux_migration.md
+/vscode_handoff_prompt.md

@@ -1,0 +1,23 @@
+; kite-healthcheck.service — one-shot probe, driven by kite-healthcheck.timer.
+;
+; Install:
+;   cp deploy/kite-healthcheck.* ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now kite-healthcheck.timer
+;
+; Deliberately a SEPARATE unit from kite-scanner.service. A probe running inside
+; the process it checks cannot report that process being wedged — which is the
+; failure it exists to catch.
+
+[Unit]
+Description=Bank Nifty scanner health probe
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kite-scanner
+Environment=TZ=Asia/Kolkata
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/kite-scanner/venv/bin/python healthcheck.py
+
+; No Restart=. A oneshot that failed has already sent its Telegram; retrying
+; would only repeat the message every 30s. The timer brings it back in 5 min.

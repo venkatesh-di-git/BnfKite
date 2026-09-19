@@ -1,0 +1,53 @@
+; kite-telegram-poller.service — accept the daily Kite login over Telegram.
+;
+; Install:
+;   cp deploy/kite-telegram-poller.service ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now kite-telegram-poller
+;
+; A user unit for the same reason kite-scanner is one: it issues
+; `systemctl --user restart kite-scanner`, which a system unit could not do
+; without root. enable-linger is already set for kite-scanner and covers this.
+
+[Unit]
+Description=Telegram poller for Kite /login
+; Deliberately NO Requires= or After=kite-scanner. This service must run when
+; the scanner is DOWN — that is the entire point of it. Coupling them would
+; mean the thing that fixes a dead scanner needs a live scanner to start.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kite-scanner
+
+; EnvironmentFile rather than relying on config.load_dotenv(). The credentials
+; are then in the environment before Python starts, instead of correct only
+; because `import config` happens to run first. A poller with no bot token is
+; the worst failure shape available: the unit is active, the logs are quiet, and
+; /login simply never answers.
+;
+; systemd parses KEY=value and ignores #-comments, which is what .env already
+; is. If a value ever needs spaces, quote it there.
+EnvironmentFile=%h/kite-scanner/.env
+
+; kite_auth._today_str() is IST-explicit in code, but the scanner unit pins TZ
+; and this process shares its cache file — keep them reading the same clock.
+Environment=TZ=Asia/Kolkata
+; Load-bearing: this reports through logging/print, and journald would show
+; nothing for minutes at a time while the buffer fills.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=%h/kite-scanner/venv/bin/python telegram_poller.py
+
+; on-failure, not always: a deliberate `systemctl --user stop` should stay
+; stopped. RestartSec=30 keeps retries clear of systemd's default start limit
+; (5 starts / 10s) — without it, a persistent failure such as a revoked bot
+; token trips the unit into a permanent failed state instead of retrying.
+Restart=on-failure
+RestartSec=30
+
+; No RestartPreventExitStatus. Unlike the scanner there is no "only a human can
+; fix this" exit here — a missing token in .env exits 1, and retrying every 30s
+; costs nothing and recovers by itself once the file is corrected.
+
+[Install]
+WantedBy=default.target

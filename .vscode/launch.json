@@ -1,0 +1,29 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "BN Volume Profile — Dashboard (app.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/app.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "BN Volume Profile — CLI (main.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Run volume profile tests",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/test_volume_profile.py",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

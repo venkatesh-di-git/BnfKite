@@ -1,0 +1,19 @@
+; kite-tokencheck.service — pre-open token reminder, driven by the timer.
+;
+; Install:
+;   cp deploy/kite-tokencheck.* ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now kite-tokencheck.timer
+
+[Unit]
+Description=Pre-open check that a usable Kite token exists for today
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kite-scanner
+Environment=TZ=Asia/Kolkata
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/kite-scanner/venv/bin/python token_check.py
+
+; No Restart=. A failed run has already sent its Telegram; the fix is a human
+; running token_helper.py, and the 09:00 firing is the second reminder.

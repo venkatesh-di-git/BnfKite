@@ -1,0 +1,76 @@
+; kite-scanner.service — systemd USER unit for the Bank Nifty scanner.
+;
+; Install:
+;   cp deploy/kite-scanner.service ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable kite-scanner
+;   loginctl enable-linger "$USER"     # REQUIRED — see below
+;
+; A user unit (not a system one) because token_helper.py already issues
+; `systemctl --user restart kite-scanner`, and because nothing here needs root.
+; The price is enable-linger: without it the user manager is torn down at logout
+; and the service neither survives your SSH session nor starts at boot.
+
+[Unit]
+Description=Bank Nifty scanner dashboard
+; No After=network-online.target on purpose — that target does not exist in the
+; user manager, so it would be a silent no-op. Restart=on-failure covers a
+; not-yet-up network at boot just as well.
+
+[Service]
+Type=simple
+; ~/kite-scanner, matching this unit's name and token_helper.SERVICE. Note the
+; directory predates the project and still holds the stale plaintext
+; access_token.txt — delete that FILE, never the directory.
+WorkingDirectory=%h/kite-scanner
+
+; Pins the naive datetime.now() calls that remain — engine.py's log-rotation
+; stamp and alert_engine.py's alert timestamps — to IST without touching their
+; injected-clock signatures. kite_auth._today_str() is IST-explicit in code.
+Environment=TZ=Asia/Kolkata
+; Load-bearing: the app reports through print(), and journald would otherwise
+; show nothing for minutes at a time while the buffer fills.
+Environment=PYTHONUNBUFFERED=1
+; Labels the dashboard VM (green badge, "VM —" tab title). Both dashboards are
+; reached at localhost:8080 — this one via SSH tunnel — so without it two
+; identical-looking tabs show different data. app.py defaults to LOCAL, so
+; nothing has to be remembered on the dev box.
+Environment=BN_INSTANCE=VM
+
+; main.py, not app.py. app.py drives its engine from ui.timer, which is
+; CLIENT-BOUND: NiceGUI awaits client.connected() and cancels the timer on
+; timeout, so with no browser attached nothing ever runs. Measured headless over
+; 12s: ui.timer fired 0 times, app.timer 11. That cost the whole 10 Aug session
+; — the service was active, bound to 127.0.0.1:8080 and serving HTTP 200
+; throughout, because every check described a serving process, not a running
+; engine.
+;
+; main.py is a plain while True: loop with no client dependency, carrying the
+; same AlertEngine, SignalStateLog, write_output and staleness watchdog.
+;
+; Cost: no dashboard until app.py's timers are split (app.timer for the engine,
+; ui.timer for the panels). Nothing listens on 8080 — `ss -ltnp | grep 8080`
+; coming back empty is correct now, not a fault.
+;
+; venv/, not .venv/ — that is how the VM was provisioned, and renaming a venv
+; breaks it (pyvenv.cfg and console-script shebangs bake in the absolute path).
+; Windows uses .venv per the README; both are gitignored.
+ExecStart=%h/kite-scanner/venv/bin/python main.py
+
+; on-failure, not always: a deliberate `systemctl --user stop` should stay
+; stopped. RestartSec=30 keeps retries clear of systemd's default start limit
+; (5 starts / 10s), so a transient network or a missing token self-heals rather
+; than tripping into a permanent failed state.
+Restart=on-failure
+RestartSec=30
+
+; Exit 78 means "no usable token and no terminal to get one" (kite_auth.
+; NoTokenError -> main.py). Restarting cannot fix that: only token_helper.py
+; can, and it restarts this service itself. Without this the scanner burns ~750
+; restarts across a session, recovering nothing. Stopping is also more honest —
+; `systemctl status` says inactive rather than "activating (auto-restart)"
+; forever. kite-healthcheck still alerts, so a stopped service gets noticed.
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=default.target

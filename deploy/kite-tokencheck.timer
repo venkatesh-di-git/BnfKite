@@ -1,0 +1,24 @@
+; kite-tokencheck.timer — remind before the open, while there is still time.
+;
+; Enable with:  systemctl --user enable --now kite-tokencheck.timer
+; Inspect with: systemctl --user list-timers kite-tokencheck.timer
+
+[Unit]
+Description=Check for a usable Kite token before the market opens
+
+[Timer]
+; 08:30 is the reminder, 09:00 the last call — both after Kite's morning token
+; expiry and comfortably before the 09:15 open, so there is time to run
+; token_helper.py and let it restart the scanner.
+;
+; Mon-Fri only: is_market_hours() already excludes weekends, and a Saturday
+; reminder to fix a token you do not need is how an alert becomes noise. NSE
+; holidays still fire once — the calendar is a known gap, tracked separately.
+OnCalendar=Mon-Fri 08:30
+OnCalendar=Mon-Fri 09:00
+; Deliberately NOT Persistent=true. A missed 08:30 firing is worthless once the
+; window has passed, and catching up at 11:00 would only be noise.
+Unit=kite-tokencheck.service
+
+[Install]
+WantedBy=timers.target

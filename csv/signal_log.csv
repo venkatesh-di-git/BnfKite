@@ -1,0 +1,1 @@
+timestamp,status,direction,grade,trend,pullback,rejection,volume,open_interest,poc,vah,val,vwap_pullback,vwap_rejection,setup,long_blocked_ema,short_blocked_ema,long_blocked_vwap,short_blocked_vwap,bar_start,current_price,open,high,low,close,bar_volume,sma20_volume,elapsed_seconds,ema_10,vwap,ema_slope,engine_version
