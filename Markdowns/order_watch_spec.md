@@ -13,7 +13,7 @@ places or cancels an order.** Same constraint as
 
 ---
 
-## STATUS — built 19 Sep 2026; live-order test done 21 Sep 2026. Ready to deploy.
+## STATUS — deployed and verified end-to-end on the VM, 21 Sep 2026.
 
 `order_premium.py`, `order_watch.py`, `test_order_watch.py` (15 passing),
 `deploy/kite-order-watch.service`, and a healthcheck probe are all written.
@@ -31,7 +31,11 @@ the websocket, never via poll. **The websocket works fine for live orders; the
 19 Sep AMO finding does not generalize to them.** That closes the one open
 question in this doc — see the finding table below.
 
-Not yet deployed to the VM.
+**21 Sep, deploy: committed (`3ddcaed`), pushed, synced to the VM, unit
+enabled and active.** `kite-scanner` was not restarted — nothing in its
+core loop imports any of these files. A real order placed afterward on the
+VM produced a correct Telegram message: detection, pricing against the
+VM's live VWAP, and delivery all confirmed working end-to-end.
 
 ---
 
@@ -182,24 +186,30 @@ redesign, if wanted.
 
 ---
 
-## Deploy checklist
+## Deploy checklist — done 21 Sep 2026
 
-- [ ] `engine_version()` still `fd8e6f05`
-- [ ] `python -m pytest -q` green (`test_order_watch.py` included, 398 passed
+- [x] `engine_version()` still `fd8e6f05`
+- [x] `python -m pytest -q` green (`test_order_watch.py` included, 398 passed
       / 1 known pre-existing unrelated failure)
-- [ ] no new dependency — `order_premium.py` and `order_watch.py` use only
+- [x] no new dependency — `order_premium.py` and `order_watch.py` use only
       `kiteconnect` and `requests`, both already present
-- [ ] `git commit` + `push`
-- [ ] `./deploy/sync.sh bnvm` — pushes the `*.py` files
-- [ ] **copy the unit by hand** — `sync.sh` does not carry `deploy/`
+- [x] `git commit` + `push` (`3ddcaed`)
+- [x] `./deploy/sync.sh bnvm` — pushes the `*.py` files
+- [x] **copy the unit by hand** — `sync.sh` does not carry `deploy/`
       (`scp deploy/kite-order-watch.service bnvm:~/.config/systemd/user/`)
-- [ ] `systemctl --user daemon-reload && enable --now kite-order-watch`
+- [x] `systemctl --user daemon-reload && enable --now kite-order-watch` —
+      active, connected, `healthcheck.py` on the VM sees it and exits 0
+
+No restart of `kite-scanner` itself needed — nothing in its core loop
+imports `order_watch.py`, `order_premium.py`, `bench_latency.py`, or
+`healthcheck.py` (confirmed by grep before deploy).
 
 ---
 
 ## Verification
 
-1. Place a small order → exactly one message, correct quantity.
+1. ~~Place a small order → exactly one message, correct quantity.~~ **Done
+   21 Sep, live on the VM, market open — message arrived correctly.**
 2. Place a size that splits → still one message, quantity = sum of splits.
 3. Let an order sit through its status transitions → no repeat messages.
 4. Restart the daemon with orders already in the book → no message on
