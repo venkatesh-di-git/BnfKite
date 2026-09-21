@@ -29,6 +29,7 @@ what confirms it.
 """
 
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -58,6 +59,13 @@ STALE_SECONDS = 180
 # branch it survives the VM being off overnight or the timer missing runs.
 STATE_FILE = os.path.join(config.CSV_DIR, ".healthcheck_state")
 
+# order_watch.py's own state file — deliberately SEPARATE from STATE_FILE
+# above. That file holds one flag for the engine check; a second
+# edge-triggered condition sharing it would clobber the engine's flag and
+# break the once-per-day guarantee the date key exists to provide.
+ORDER_WATCH_STATE_FILE = os.path.join(config.CSV_DIR, ".healthcheck_order_watch_state")
+ORDER_WATCH_SERVICE = "kite-order-watch"
+
 # Grace after the open, before the heartbeat can exist at all.
 #
 # write_output() only runs once a bar CLOSES, so the first write of the day
@@ -73,22 +81,74 @@ STATE_FILE = os.path.join(config.CSV_DIR, ".healthcheck_state")
 OPEN_GRACE_SECONDS = 600
 
 
-def _load_state(today: str) -> str:
-    """'down' only if we already alerted TODAY; anything else reads as healthy."""
+def _load_state(today: str, path: str = STATE_FILE) -> str:
+    """'down' only if we already alerted TODAY; anything else reads as healthy.
+
+    `path` defaults to the engine's own STATE_FILE so every existing call
+    site is unchanged; order_watch's probe passes ORDER_WATCH_STATE_FILE so
+    the two edge-triggers never share — and can never clobber — one flag.
+    """
     try:
-        with open(STATE_FILE) as f:
+        with open(path) as f:
             state, _, when = f.read().strip().partition(" ")
     except OSError:
         return "ok"
     return "down" if state == "down" and when == today else "ok"
 
 
-def _save_state(state: str, today: str) -> None:
+def _save_state(state: str, today: str, path: str = STATE_FILE) -> None:
     try:
-        with open(STATE_FILE, "w") as f:
+        with open(path, "w") as f:
             f.write(f"{state} {today}")
     except OSError:
         pass  # see notify(): an unwritable state file must never suppress an alert
+
+
+def _check_order_watch(now: datetime) -> int:
+    """Probes `systemctl --user is-active kite-order-watch`.
+
+    Deliberately called from main() ABOVE the is_market_hours() early return
+    below — order_watch.py's whole point is detecting orders placed OUTSIDE
+    market hours too (an AMO queues fine on a closed market, per STATUS in
+    Markdowns/pending_order_black76_telegram_latency_test_v2.md), so a check
+    that only ran during market hours would miss exactly the case that
+    matters most: the service dying overnight before a morning AMO.
+
+    No systemctl on this machine (e.g. a dev workstation, not the VM) is not
+    a failure to alert on — it means this probe cannot answer the question
+    here, so it says nothing rather than firing a false "down".
+    """
+    today = now.strftime("%Y-%m-%d")
+    already_alerted = _load_state(today, ORDER_WATCH_STATE_FILE) == "down"
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", ORDER_WATCH_SERVICE],
+            capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        return 0  # no systemctl here — nothing this probe can determine
+    except subprocess.TimeoutExpired:
+        # A hung systemctl call is itself worth surfacing, same edge-trigger
+        # shape as a genuine "not active" — but never crash the rest of the
+        # script over it.
+        if not already_alerted:
+            notify(f"{ORDER_WATCH_SERVICE}: systemctl did not respond within 10s")
+            _save_state("down", today, ORDER_WATCH_STATE_FILE)
+        return 1
+
+    active = result.stdout.strip() == "active"
+
+    if not active:
+        if not already_alerted:
+            notify(f"{ORDER_WATCH_SERVICE} is not running "
+                  f"(systemctl reports: {result.stdout.strip() or 'unknown'})")
+            _save_state("down", today, ORDER_WATCH_STATE_FILE)
+        return 1
+
+    if already_alerted:
+        notify(f"recovered — {ORDER_WATCH_SERVICE} is active again")
+        _save_state("ok", today, ORDER_WATCH_STATE_FILE)
+    return 0
 
 
 def notify(text: str) -> None:
@@ -110,8 +170,14 @@ def notify(text: str) -> None:
 
 def main() -> int:
     now = datetime.now(IST)
+
+    # ABOVE the market-hours gate below, on purpose — see _check_order_watch's
+    # docstring. This probe must run every invocation, not just during market
+    # hours, or it would miss the service dying exactly when an AMO needs it.
+    order_watch_status = _check_order_watch(now)
+
     if not is_market_hours(now):
-        return 0
+        return order_watch_status
 
     # Silent during the grace window: no bar has closed yet, so there is nothing
     # to probe. Deliberately returns 0 rather than skipping the state handling —
@@ -120,7 +186,7 @@ def main() -> int:
     open_at = now.replace(hour=config.MARKET_OPEN_HOUR,
                           minute=config.MARKET_OPEN_MINUTE, second=0, microsecond=0)
     if (now - open_at).total_seconds() < OPEN_GRACE_SECONDS:
-        return 0
+        return order_watch_status
 
     today = now.strftime("%Y-%m-%d")
     already_alerted = _load_state(today) == "down"
@@ -146,14 +212,16 @@ def main() -> int:
         if not already_alerted:
             notify(problem)
             _save_state("down", today)
-        return 1
+        return 1  # engine problem always exits 1 regardless of order_watch_status
 
     if already_alerted:
         # Worth its own message: it confirms token_helper.py worked without you
         # having to go and look.
         notify(f"recovered — {name} is being written again")
         _save_state("ok", today)
-    return 0
+    # Engine is healthy — the exit code still reflects order_watch_status, so a
+    # dead order-watch service doesn't disappear just because the engine is fine.
+    return order_watch_status
 
 
 if __name__ == "__main__":

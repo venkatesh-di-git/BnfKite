@@ -23,8 +23,6 @@ Standalone. No existing file is modified to build this.
 """
 
 import argparse
-import json
-import os
 import statistics
 import sys
 import threading
@@ -42,6 +40,7 @@ import config
 from engine import is_market_hours
 from instruments import get_current_month_contract
 from kite_auth import try_cached_session
+from order_premium import parse_order_timestamp, run_order_premium
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -343,36 +342,12 @@ class _Recorder:
             return len(self.orders)
 
 
-def _parse_order_timestamp(value) -> Optional[datetime]:
-    """The REST orders() response comes back already parsed into a datetime
-    by kiteconnect's _format_response (only when the string is exactly 19
-    chars, i.e. second resolution — confirming the ±1s bracket). The
-    websocket postback does NOT go through that parser (ticker.py's
-    _parse_text_message hands the raw JSON dict straight to on_order_update),
-    so there it arrives as a string. Handle both.
-
-    NOT independently verified against a live postback payload — the market
-    was closed while this was written. If the field name or format differs
-    on the day, this is the function to fix; see the spec's "Running it".
-    """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=None)
-    if isinstance(value, str):
-        try:
-            return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None
-    return None
-
-
 def _make_ws_handler(recorder: _Recorder):
     def on_order_update(ws, data):
         order_id = data.get("order_id")
         if not order_id:
             return
-        ts = _parse_order_timestamp(data.get("order_timestamp")
+        ts = parse_order_timestamp(data.get("order_timestamp")
                                     or data.get("exchange_timestamp"))
         recorder.record_ws(order_id, ts, data.get("status", "?"))
     return on_order_update
@@ -385,205 +360,11 @@ def _polling_loop(kite, recorder: _Recorder, stop_event: threading.Event) -> Non
                 order_id = o.get("order_id")
                 if not order_id:
                     continue
-                ts = _parse_order_timestamp(o.get("order_timestamp"))
+                ts = parse_order_timestamp(o.get("order_timestamp"))
                 recorder.record_poll(order_id, ts)
         except Exception as e:
             print(f"  [poll] error: {type(e).__name__}: {e}")
         stop_event.wait(POLL_INTERVAL_SECONDS)
-
-
-# ===========================================================================
-# order-premium — price the pending order's own strike against futures VWAP
-# ===========================================================================
-
-# Statuses that mean "this order is still live in the book". Everything else
-# (CANCELLED / COMPLETE / REJECTED) is history and must not be priced.
-LIVE_ORDER_STATUSES = ("OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED")
-
-
-def resolve_vwap(explicit, futures_symbol: str):
-    """(vwap, source_label) on success, (None, reason) on refusal.
-
-    Two sources only, by design:
-      --vwap            supplied by hand (closed-market testing)
-      the project's own VWAP, which the scanner already computes and writes to
-      config.OUTPUT_FILE via engine.write_output() (engine.py:439)
-
-    Kite's own `average_price` is deliberately NOT used: it returns 0 outside
-    market hours, and the whole point is to reuse the number this project
-    already calculates rather than introduce a second, differently-derived one.
-
-    THE STALENESS GUARDS ARE THE POINT OF THIS FUNCTION. That JSON file
-    survives the scanner stopping, so yesterday's VWAP reads as a perfectly
-    ordinary float. Pricing a September strike against an August VWAP would
-    produce a confident, wrong number with nothing to hint at it — so this
-    refuses instead, on either a contract mismatch or a date that is not
-    today's session.
-    """
-    if explicit is not None:
-        return float(explicit), "supplied via --vwap"
-
-    path = config.OUTPUT_FILE
-    if not os.path.exists(path):
-        return None, (f"{path} not found — the scanner has never written it on "
-                     f"this machine")
-    try:
-        with open(path) as f:
-            payload = json.load(f)
-    except (OSError, ValueError) as e:
-        return None, f"could not read {path}: {type(e).__name__}: {e}"
-
-    vwap = payload.get("vwap")
-    if vwap is None:
-        return None, f"{os.path.basename(path)} carries no vwap value"
-
-    instrument = payload.get("instrument")
-    if instrument != futures_symbol:
-        return None, (f"contract mismatch — file has {instrument}, current "
-                     f"month is {futures_symbol}")
-
-    stamp = payload.get("timestamp")
-    try:
-        written = datetime.fromisoformat(stamp)
-    except (TypeError, ValueError):
-        return None, f"unparseable timestamp in {os.path.basename(path)}: {stamp!r}"
-    if written.tzinfo is None:
-        written = written.replace(tzinfo=IST)
-
-    now = datetime.now(IST)
-    if written.astimezone(IST).date() != now.date():
-        return None, (f"stale — written {written.astimezone(IST):%Y-%m-%d %H:%M:%S}, "
-                     f"not today's session")
-
-    age = (now - written).total_seconds()
-    return float(vwap), f"{os.path.basename(path)} (age {age:.0f}s)"
-
-
-def _format_order_premium(symbol, side, qty, status, limit_price, premium,
-                          diff, pct, fut_ltp, vwap, days) -> str:
-    """Curated to ONE thing the Kite app cannot show.
-
-    No IV, no Greeks, no option VWAP — the app already displays all three on
-    the same screen he places the order from, so repeating them here is just
-    re-sending what he is already looking at.
-
-    What the app cannot do is reprice this strike off a DIFFERENT underlying
-    level: what it is worth if the future mean-reverts to its VWAP. That
-    cross-instrument number is the only reason this message exists.
-    """
-    verdict = "CHEAP" if diff > 0 else "RICH"
-    gap = fut_ltp - vwap
-    side_word = "above" if gap >= 0 else "below"
-    lines = [
-        "📊 " + str(symbol),
-        f"{side} {qty} @ {limit_price} · {status}",
-        "",
-        f"If BNF @ VWAP {vwap:g} → {premium:.2f}",
-        f"Your limit {limit_price} → {diff:+.2f} ({pct:+.2f}%) {verdict}",
-        "",
-        f"BNF {fut_ltp:g} spot · {abs(gap):.0f} pts {side_word} VWAP · {days:.1f}d",
-    ]
-    return chr(10).join(lines)
-
-
-def run_order_premium(kite, explicit_vwap, send_telegram: bool = True) -> None:
-    orders = kite.orders()
-    live = [o for o in orders if o.get("status") in LIVE_ORDER_STATUSES]
-    if not live:
-        print("No live orders in the book — nothing to price.")
-        print(f"(Looked for: {', '.join(LIVE_ORDER_STATUSES)})")
-        return
-
-    contract = get_current_month_contract(kite)
-    if contract is None:
-        print("Could not resolve a BANKNIFTY futures contract. Aborting.")
-        return
-
-    vwap, source = resolve_vwap(explicit_vwap, contract.tradingsymbol)
-    if vwap is None:
-        print(f"Cannot resolve VWAP: {source}")
-        print("Pass --vwap <number> to supply it explicitly.")
-        return
-
-    fut_key = f"NFO:{contract.tradingsymbol}"
-    fut_ltp = kite.ltp([fut_key])[fut_key]["last_price"]
-
-    # One instruments download, indexed by token — the order carries
-    # instrument_token, which is exact, unlike parsing the tradingsymbol.
-    by_token = {i["instrument_token"]: i for i in kite.instruments("NFO")}
-
-    r = black76.DEFAULT_RISK_FREE_RATE
-    print(f"Futures : {contract.tradingsymbol}  LTP {fut_ltp}  VWAP {vwap}")
-    print(f"VWAP src: {source}")
-    print(f"Rate    : {r:.3%} (hardcoded)\n")
-
-    for o in live:
-        symbol = o.get("tradingsymbol")
-        inst = by_token.get(o.get("instrument_token"))
-        if inst is None:
-            print(f"{symbol}: not found in the NFO dump — skipped.\n")
-            continue
-        if inst.get("instrument_type") not in ("CE", "PE"):
-            print(f"{symbol}: not an option ({inst.get('instrument_type')}) — "
-                 f"Black-76 does not apply, skipped.\n")
-            continue
-
-        strike = inst["strike"]
-        is_call = inst["instrument_type"] == "CE"
-        expiry = inst["expiry"]
-        limit_price = o.get("price")
-
-        # THE FORWARD MUST MATCH THE OPTION'S EXPIRY. Black-76 prices an option
-        # off the futures of its OWN expiry; pricing a December option against
-        # September's VWAP is simply the wrong forward, and it would look
-        # perfectly ordinary in the output. Refuse rather than mislead — the
-        # VWAP in hand belongs to one contract only.
-        if (expiry.year, expiry.month) != (contract.expiry.year, contract.expiry.month):
-            print(f"{symbol}: expiry {expiry} is not the contract the VWAP "
-                 f"belongs to ({contract.tradingsymbol}, {contract.expiry}) — "
-                 f"skipped rather than priced off the wrong forward." + chr(10))
-            continue
-
-        opt_key = f"NFO:{symbol}"
-        opt_ltp = kite.ltp([opt_key])[opt_key]["last_price"]
-
-        now_naive = datetime.now(IST).replace(tzinfo=None)
-        days = (datetime.combine(expiry, datetime.min.time()) - now_naive).total_seconds() / 86400
-        T = max(days, 0.0001) / 365.0
-
-        # IV from the option's OWN market price at the CURRENT futures level...
-        iv = black76.implied_vol(fut_ltp, strike, T, r, opt_ltp, is_call)
-
-        print(f"{symbol}   {o.get('transaction_type')} {o.get('quantity')} "
-             f"@ {limit_price}   [{o.get('status')}]")
-        print(f"  strike {strike:.0f} {inst['instrument_type']}  "
-             f"expiry {expiry}  ({days:.2f}d)  LTP {opt_ltp}")
-
-        if iv is None:
-            print("  IV: no root in bracket (stale/closed-market quote) — "
-                 "cannot price.\n")
-            continue
-
-        # ...then the same strike re-priced as if the future sat at its VWAP.
-        premium = black76.price(vwap, strike, T, r, iv, is_call)
-        g = black76.greeks(vwap, strike, T, r, iv, is_call)
-        diff = premium - limit_price if limit_price else None
-
-        print(f"  IV {iv:.4f}  ->  equivalent premium at VWAP: {premium:.2f}")
-        if diff is not None:
-            verdict = "limit is CHEAP vs VWAP" if diff > 0 else "limit is RICH vs VWAP"
-            pct = (diff / limit_price * 100) if limit_price else 0.0
-            print(f"  vs limit {limit_price}: {diff:+.2f} ({pct:+.2f}%)  — {verdict}")
-        print(f"  delta {g.delta:.3f}  gamma {g.gamma:.6f}  vega {g.vega:.2f}  "
-             f"theta {g.theta / 365:.2f}/day")
-
-        if send_telegram and diff is not None:
-            text = _format_order_premium(
-                symbol, o.get("transaction_type"), o.get("quantity"),
-                o.get("status"), limit_price, premium, diff, pct,
-                fut_ltp, vwap, days)
-            print("  telegram:", "sent" if _send_telegram(text) else "FAILED")
-        print()
 
 
 def check_ws_connectivity(kite, timeout_seconds: float = 10.0) -> bool:
@@ -638,13 +419,24 @@ def check_ws_connectivity(kite, timeout_seconds: float = 10.0) -> bool:
 
 
 def run_mode_b(kite, max_orders: int) -> None:
+    """Gated on market hours for a reason that ISN'T "orders can only be
+    placed live" — that claim was wrong and is corrected here. Orders are
+    placed fine on a closed market via AMO (verified 19 Sep). The real
+    reason: an AMO gets NO exchange_order_id until Kite pushes it to NSE at
+    pre-open, and on_order_update carries exchange events — so an AMO is
+    structurally invisible to the websocket. This loop would just sit
+    connected and silent, which is a worse experience than refusing outright.
+    """
     now = datetime.now(IST)
     if not is_market_hours(now):
-        print("Mode B's order-listening loop requires the market to be open "
-             "(orders can only be placed and detected live).")
-        print("Run `python bench_latency.py check-ws` instead to at least "
-             "confirm the websocket connects — that part needs no market "
-             "hours. Or come back during market hours for the full test.")
+        print("Mode B's order-listening loop is gated on market hours, but not "
+             "because orders can't be placed outside them — they can, via AMO.")
+        print("The real reason: an AMO gets no exchange_order_id until Kite "
+             "pushes it to NSE at pre-open, and on_order_update only carries "
+             "exchange events. So it would connect and sit silent.")
+        print("Run `python bench_latency.py check-ws` instead to confirm the "
+             "websocket connects — that part needs no market hours. Or come "
+             "back during market hours for the full test.")
         return
 
     print(f"Mode B — listening for up to {max_orders} phone-placed orders.")
@@ -780,7 +572,7 @@ def main():
     elif args.mode == "mode-b":
         run_mode_b(kite, args.max_orders)
     elif args.mode == "order-premium":
-        run_order_premium(kite, args.vwap, send_telegram=not args.no_telegram)
+        run_order_premium(kite, args.vwap, send_telegram_flag=not args.no_telegram)
     else:
         check_ws_connectivity(kite, args.timeout)
 

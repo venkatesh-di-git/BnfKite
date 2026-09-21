@@ -1,0 +1,53 @@
+; kite-order-watch.service — auto-detect a placed order, price it, message once.
+;
+; Install:
+;   cp deploy/kite-order-watch.service ~/.config/systemd/user/
+;   systemctl --user daemon-reload
+;   systemctl --user enable --now kite-order-watch
+;
+; A user unit for the same reason kite-scanner and kite-telegram-poller are:
+; runs under the same account that holds the Kite session, no root needed.
+; enable-linger is already set for kite-scanner and covers this too.
+
+[Unit]
+Description=Auto-detect a placed order and message its VWAP-equivalent premium
+; Deliberately NO Requires= or After=kite-scanner. order_watch.py reads
+; latest_volume_profile.json itself and refuses cleanly (order_premium.py's
+; resolve_vwap staleness guard) when the scanner isn't writing it — it does
+; not need the scanner UP to start, only to have SOMETHING useful to report
+; once it does start pricing.
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kite-scanner
+
+; EnvironmentFile rather than relying on config.load_dotenv() — same reasoning
+; as kite-telegram-poller.service. The credentials are then in the environment
+; before Python starts, instead of correct only because `import config`
+; happens to run first. A daemon with no bot token is the worst failure shape
+; available: the unit is active, the logs are quiet, and nothing ever arrives.
+EnvironmentFile=%h/kite-scanner/.env
+
+; kite_auth._today_str() is IST-explicit in code, and order_premium.py's VWAP
+; freshness guard compares dates — keep this process reading the same clock
+; as the scanner and the poller.
+Environment=TZ=Asia/Kolkata
+; Load-bearing: this reports through logging, and journald would show nothing
+; for minutes at a time while the buffer fills.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=%h/kite-scanner/venv/bin/python order_watch.py
+
+; on-failure, not always: a deliberate `systemctl --user stop` should stay
+; stopped. RestartSec=30 keeps retries clear of systemd's default start limit
+; (5 starts / 10s) — same reasoning as the poller unit.
+Restart=on-failure
+RestartSec=30
+
+; No RestartPreventExitStatus. A missing/expired Kite session exits 1 at
+; startup (try_cached_session returns None — order_watch.py checks this
+; itself, same as the poller's own login gate), and retrying every 30s costs
+; nothing and recovers on its own once a fresh /login lands.
+
+[Install]
+WantedBy=default.target
