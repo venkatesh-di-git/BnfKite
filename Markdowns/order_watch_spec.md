@@ -13,7 +13,39 @@ places or cancels an order.** Same constraint as
 
 ---
 
-## STATUS — deployed and verified end-to-end on the VM, 21 Sep 2026.
+## STATUS — deployed 21 Sep 2026; mid-run session-expiry bug found and fixed 22 Sep 2026.
+
+**22 Sep incident.** No new-order alerts all morning; normal scanner alerts
+were unaffected. Root cause: `token_helper.py` only restarts `kite-scanner`
+on a fresh daily login, never `kite-order-watch` — so the daemon kept
+running on **yesterday's** access token across the day boundary. From
+07:06 IST both detection channels were dead: `kite.orders()` raised
+`TokenException` every poll, and the websocket was stuck in a 403-forbidden
+reconnect loop — all while `systemctl --user is-active` kept reporting
+`active`, so the healthcheck probe saw nothing wrong. Silent for 6+ hours
+until manually restarted.
+
+**Fix:** `TokenException` on the poll is now treated as fatal —
+`_poll_once()` calls `os._exit(1)` (default `exit_fn`, injectable for
+tests), which kills the whole process, websocket included, so
+`Restart=on-failure` / `RestartSec=30` brings it back and re-reads the
+session cache fresh. Self-heals the moment that day's `/login` has landed;
+no separate handling needed for the websocket's reconnect loop, since it
+dies with the process. Two new tests
+(`test_a_token_exception_on_poll_exits_the_process`,
+`test_an_ordinary_poll_failure_does_not_exit`) cover the distinction —
+a transient network error must NOT exit the process, only a confirmed dead
+session should. Deployed and restarted the same day.
+
+**Not fixed, deliberately out of scope for this patch:** the healthcheck
+probe still just checks `is-active`, which is a weak signal now that the
+daemon crash-loops on a dead token rather than lying dormant — it's an
+improvement over silent "active" forever, but not a guarantee of catching
+it between restarts. A probe that actually exercises the session (e.g.
+`kite.profile()`) would close that gap; not built here, since the crash
+loop already makes the *existing* probe meaningfully more likely to catch
+it, and a same-day fix for an active incident is not the moment to widen
+scope.
 
 `order_premium.py`, `order_watch.py`, `test_order_watch.py` (15 passing),
 `deploy/kite-order-watch.service`, and a healthcheck probe are all written.

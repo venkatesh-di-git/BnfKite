@@ -20,6 +20,7 @@ themselves (verified separately that those are not).
 from datetime import date, datetime, timedelta
 
 import pytest
+from kiteconnect.exceptions import TokenException
 
 import order_premium
 import order_watch as ow
@@ -255,3 +256,38 @@ def test_orderwatch_has_no_placement_or_cancellation_surface():
     src = inspect.getsource(ow)
     for forbidden in ("place_order", "cancel_order", "modify_order"):
         assert forbidden not in src, f"{forbidden} must never appear in order_watch.py"
+
+
+# --------------------------------------------------- session goes stale mid-run
+
+def test_a_token_exception_on_poll_exits_the_process(wired):
+    """Measured live 22 Sep: a session that expires WHILE the daemon is
+    already running (not just a stale one at startup) surfaced as
+    TokenException on kite.orders() forever, logged as a WARNING and
+    ignored — both channels silently dead for 6+ hours, service still
+    reporting "active" the whole time. TokenException must now be fatal:
+    exit_fn is called so systemd restarts the process and it re-reads the
+    session cache fresh, rather than looping forever on a dead token."""
+    watch, kite, sent, now = wired
+
+    def _raise():
+        raise TokenException("Incorrect `api_key` or `access_token`.")
+    kite.orders = _raise
+
+    calls = []
+    ow._poll_once(kite, watch, exit_fn=lambda code: calls.append(code))
+    assert calls == [1]
+
+
+def test_an_ordinary_poll_failure_does_not_exit(wired):
+    """A transient network blip is not the same failure — must not exit the
+    process over it, or a single dropped connection kills the daemon."""
+    watch, kite, sent, now = wired
+
+    def _raise():
+        raise ConnectionError("temporary network blip")
+    kite.orders = _raise
+
+    calls = []
+    ow._poll_once(kite, watch, exit_fn=lambda code: calls.append(code))
+    assert calls == []

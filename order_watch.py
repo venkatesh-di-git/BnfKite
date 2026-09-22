@@ -45,6 +45,7 @@ this needs to run whether or not the scanner is up.
 """
 
 import logging
+import os
 import sys
 import threading
 import time
@@ -54,6 +55,7 @@ from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from kiteconnect import KiteTicker
+from kiteconnect.exceptions import TokenException
 
 import config
 from instruments import get_current_month_contract
@@ -236,13 +238,37 @@ def _make_ws_handler(watch: OrderWatch):
     return on_order_update
 
 
+def _poll_once(kite, watch: OrderWatch, exit_fn=lambda code: os._exit(code)) -> None:
+    """One poll iteration, split out from the loop so a test can drive it
+    directly without a real 15s wait.
+
+    Measured live 22 Sep: a session that goes stale WHILE RUNNING (the daily
+    token expiring under an already-running process, not just an expired one
+    at startup) surfaces here as TokenException on kite.orders() — and, per
+    the same root cause, as a 403 on every websocket reconnect attempt too.
+    Before this fix that just logged a WARNING forever: both channels dead
+    from 07:06 to 13:10 that day, service reporting "active" throughout,
+    silent. TokenException is now fatal on purpose — exit_fn defaults to
+    os._exit(1), which kills the whole process (websocket included; the
+    reconnect-403 loop dies with it) so systemd's Restart=on-failure /
+    RestartSec=30 brings it back and re-reads the session cache fresh. That
+    self-heals the moment the day's token_helper.py login lands, with no
+    separate fix needed for the websocket side.
+    """
+    try:
+        for o in kite.orders():
+            watch.observe(o)
+    except TokenException as e:
+        logger.error("Kite session expired mid-run (%s) — exiting so systemd "
+                     "restarts fresh once today's /login has landed", e)
+        exit_fn(1)
+    except Exception as e:
+        logger.warning("poll failed: %s: %s", type(e).__name__, e)
+
+
 def _polling_loop(kite, watch: OrderWatch, stop_event: threading.Event) -> None:
     while not stop_event.is_set():
-        try:
-            for o in kite.orders():
-                watch.observe(o)
-        except Exception as e:
-            logger.warning("poll failed: %s: %s", type(e).__name__, e)
+        _poll_once(kite, watch)
         stop_event.wait(POLL_INTERVAL_SECONDS)
 
 
