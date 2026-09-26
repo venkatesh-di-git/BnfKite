@@ -39,6 +39,7 @@ import requests
 
 import config
 from engine import is_market_hours
+from kite_auth import has_token_for_today
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -81,49 +82,102 @@ ORDER_WATCH_SERVICE = "kite-order-watch"
 OPEN_GRACE_SECONDS = 600
 
 
-def _load_state(today: str, path: str = STATE_FILE) -> str:
-    """'down' only if we already alerted TODAY; anything else reads as healthy.
-
-    `path` defaults to the engine's own STATE_FILE so every existing call
-    site is unchanged; order_watch's probe passes ORDER_WATCH_STATE_FILE so
-    the two edge-triggers never share — and can never clobber — one flag.
-    """
+def _load_state(today: str) -> str:
+    """'down' only if we already alerted TODAY; anything else reads as healthy."""
     try:
-        with open(path) as f:
+        with open(STATE_FILE) as f:
             state, _, when = f.read().strip().partition(" ")
     except OSError:
         return "ok"
     return "down" if state == "down" and when == today else "ok"
 
 
-def _save_state(state: str, today: str, path: str = STATE_FILE) -> None:
+def _save_state(state: str, today: str) -> None:
     try:
-        with open(path, "w") as f:
+        with open(STATE_FILE, "w") as f:
             f.write(f"{state} {today}")
     except OSError:
         pass  # see notify(): an unwritable state file must never suppress an alert
 
 
+def _load_watch_state(today: str):
+    """Returns (state, nrestarts) for order-watch, or ('ok', None) if the file
+    is absent or from another day.
+
+    Separate from _load_state above rather than a shared helper with a path
+    argument: this one carries a second field the engine check has no use for,
+    and the engine check is the load-bearing one — it must not acquire new
+    parsing paths to serve this probe.
+
+    nrestarts is kept as the raw string; it is only ever compared for equality
+    against the next probe's value, never arithmetic.
+    """
+    try:
+        with open(ORDER_WATCH_STATE_FILE) as f:
+            parts = f.read().strip().split()
+    except OSError:
+        return "ok", None
+    if len(parts) < 2 or parts[1] != today:
+        return "ok", None
+    return parts[0], (parts[2] if len(parts) > 2 else None)
+
+
+def _save_watch_state(state: str, today: str, nrestarts) -> None:
+    try:
+        with open(ORDER_WATCH_STATE_FILE, "w") as f:
+            line = f"{state} {today}"
+            if nrestarts is not None:
+                line += f" {nrestarts}"
+            f.write(line)
+    except OSError:
+        pass  # see notify(): an unwritable state file must never suppress an alert
+
+
 def _check_order_watch(now: datetime) -> int:
-    """Probes `systemctl --user is-active kite-order-watch`.
+    """Probes kite-order-watch, edge-triggered, ONE message per transition.
 
     Deliberately called from main() ABOVE the is_market_hours() early return
     below — order_watch.py's whole point is detecting orders placed OUTSIDE
-    market hours too (an AMO queues fine on a closed market, per STATUS in
-    Markdowns/pending_order_black76_telegram_latency_test_v2.md), so a check
-    that only ran during market hours would miss exactly the case that
-    matters most: the service dying overnight before a morning AMO.
+    market hours too (an AMO queues fine on a closed market), so a check that
+    only ran during market hours would miss exactly the case that matters
+    most: the service dying overnight before a morning AMO.
 
-    No systemctl on this machine (e.g. a dev workstation, not the VM) is not
-    a failure to alert on — it means this probe cannot answer the question
-    here, so it says nothing rather than firing a false "down".
+    Two things this must NOT do, both learned from Sat 26 Sep, when it sent 24
+    Telegrams on a closed market.
+
+    It must not alert when order-watch CANNOT run. Without today's token
+    order_watch.py exits 1 at startup by design, so on any non-trading day it
+    crash-loops forever — expected, not a fault. The gate is the token cache
+    rather than a weekday/market-hours test on purpose: is_market_hours() only
+    knows weekends, and this codebase deliberately carries no NSE holiday
+    calendar (see config.py's SEED_LOOKBACK_DAYS note), so a weekday gate
+    would still fire all through Diwali. kite-tokencheck.timer already owns
+    the "you have no token" alert, so nothing is lost by staying quiet here.
+
+    And it must not read a crash loop as health. `systemctl is-active` returns
+    "activating" for ~30 of every 31 seconds of a RestartSec=30 loop and
+    briefly "active" in between, so a single binary is-active check sampled
+    every 5 minutes reported down -> recovered -> down -> recovered
+    indefinitely. Hence SubState, and hence comparing NRestarts against the
+    previous probe: a unit that restarted since we last looked is not healthy,
+    whatever it happens to report this instant.
+
+    No systemctl on this machine (e.g. a dev workstation, not the VM) is not a
+    failure to alert on — it means this probe cannot answer the question here,
+    so it says nothing rather than firing a false "down".
     """
     today = now.strftime("%Y-%m-%d")
-    already_alerted = _load_state(today, ORDER_WATCH_STATE_FILE) == "down"
+
+    if not has_token_for_today(config.KITE_API_KEY):
+        return 0  # no session today: order-watch cannot run, and that is not a fault
+
+    prev_state, prev_restarts = _load_watch_state(today)
+    already_alerted = prev_state == "down"
 
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "is-active", ORDER_WATCH_SERVICE],
+            ["systemctl", "--user", "show", ORDER_WATCH_SERVICE,
+             "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts"],
             capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
         return 0  # no systemctl here — nothing this probe can determine
@@ -133,21 +187,41 @@ def _check_order_watch(now: datetime) -> int:
         # script over it.
         if not already_alerted:
             notify(f"{ORDER_WATCH_SERVICE}: systemctl did not respond within 10s")
-            _save_state("down", today, ORDER_WATCH_STATE_FILE)
+            _save_watch_state("down", today, prev_restarts)
         return 1
 
-    active = result.stdout.strip() == "active"
+    props = dict(line.split("=", 1)
+                 for line in result.stdout.strip().splitlines() if "=" in line)
+    active_state = props.get("ActiveState", "unknown")
+    sub_state = props.get("SubState", "unknown")
+    restarts = props.get("NRestarts")
 
-    if not active:
+    # A restart between two probes means it is looping, even if this sample
+    # caught the brief running window. Unknown on the first probe of a day,
+    # which is harmless: a real loop reports auto-restart almost every time.
+    restarted_since_last_probe = (prev_restarts is not None
+                                  and restarts is not None
+                                  and restarts != prev_restarts)
+    stable = active_state == "active" and sub_state == "running"
+
+    if not stable or restarted_since_last_probe:
         if not already_alerted:
-            notify(f"{ORDER_WATCH_SERVICE} is not running "
-                  f"(systemctl reports: {result.stdout.strip() or 'unknown'})")
-            _save_state("down", today, ORDER_WATCH_STATE_FILE)
+            if restarted_since_last_probe or sub_state == "auto-restart":
+                notify(f"{ORDER_WATCH_SERVICE} is crash-looping "
+                      f"({restarts} restarts) — {active_state}/{sub_state}")
+            else:
+                notify(f"{ORDER_WATCH_SERVICE} is not running "
+                      f"— {active_state}/{sub_state}")
+            _save_watch_state("down", today, restarts)
+        else:
+            # Still down, no new message — but keep the counter current so the
+            # next probe compares against this sample, not a stale one.
+            _save_watch_state("down", today, restarts)
         return 1
 
     if already_alerted:
-        notify(f"recovered — {ORDER_WATCH_SERVICE} is active again")
-        _save_state("ok", today, ORDER_WATCH_STATE_FILE)
+        notify(f"recovered — {ORDER_WATCH_SERVICE} is running again")
+    _save_watch_state("ok", today, restarts)
     return 0
 
 

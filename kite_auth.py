@@ -88,6 +88,18 @@ def _save_token_cache(api_key: str, access_token: str) -> None:
         pass
 
 
+def has_token_for_today(api_key: str) -> bool:
+    """True if a cached token for TODAY exists.
+
+    File-only, no network — unlike try_cached_session(), which also calls
+    profile() to verify. Exists for probes that run on a short timer and only
+    need to know whether a session COULD be established, not whether it
+    currently works: healthcheck.py uses it to stay silent about services
+    that legitimately cannot run before the day's login has landed.
+    """
+    return _load_cached_token(api_key) is not None
+
+
 def try_cached_session(api_key: str) -> KiteConnect | None:
     """Returns a ready-to-use KiteConnect if a valid cached token exists
     for today, else None. Never blocks on input — safe to call from a
