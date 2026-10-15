@@ -85,6 +85,13 @@ class IndicatorSnapshot:
     # engine.snapshot(), which reports BAR_SECONDS for a completed bar.
     # Absent means "treat as complete", i.e. no projection.
     elapsed_seconds: Optional[float] = None
+    # LOGGED ONLY — carried to signal_log/alert_log for the backtest comparison
+    # (Markdowns/backtest_vwap_pullback_oct2026.md). No rule reads these; a test
+    # enforces that this module never references them.
+    ema20_15m: Optional[float] = None
+    slope_15m: Optional[float] = None
+    vol_ratio_projected: Optional[float] = None
+    vol_ratio_last_closed: Optional[float] = None
 
 
 @dataclass

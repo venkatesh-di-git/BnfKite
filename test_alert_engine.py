@@ -198,12 +198,12 @@ def test_queued_message_is_delivered_and_survives_failure():
         original_post, alert_engine.requests.post = alert_engine.requests.post, flaky_post
         engine = AlertEngine()
         try:
-            # An hour apart: the second is a B-grade flip, and this test needs it
-            # DELIVERED to prove the worker survived the first failure.
+            # The second must be a DELIVERED grade to prove the worker survived
+            # the first failure — A, since B is log-only (TELEGRAM_GRADES).
             t = datetime(2026, 8, 14, 10, 0, 0)
             engine.process_decision(make_decision(Status.ENTRY, Direction.LONG, Grade.A_PLUS),
                                     100, now=t)
-            engine.process_decision(make_decision(Status.ENTRY, Direction.SHORT, Grade.B),
+            engine.process_decision(make_decision(Status.ENTRY, Direction.SHORT, Grade.A),
                                     99, now=t + timedelta(hours=1))
             assert delivered.wait(timeout=5), "worker died after the first failure"
             assert len(calls) == 2
@@ -533,6 +533,72 @@ def test_telegram_enabled_by_default_for_live_callers():
     finally:
         alert_engine.requests.post = original
     print("PASS: Telegram stays enabled by default for live callers\n")
+
+
+def _stub_post():
+    original, alert_engine.requests.post = alert_engine.requests.post, lambda *a, **k: None
+    return original
+
+
+def test_b_grade_is_logged_but_never_delivered():
+    """B was dropped from Telegram on 15 Oct 2026 — delivery only. It must still
+    be recorded with its grade, or the backtest/live comparison loses B entirely."""
+    def body():
+        engine = AlertEngine()
+        record = engine.process_decision(
+            make_decision(Status.ENTRY, Direction.LONG, Grade.B), 100, bar_start=BAR)
+        assert record is not None and record.grade == "B"
+        assert len(engine.history) == 1
+        assert any(r["id"] == record.id and r["grade"] == "B" for r in read_recent_alerts(20))
+        assert engine._delivery_thread is None
+        assert engine._delivery_queue.empty()
+    original = _stub_post()
+    try:
+        _with_telegram_configured(body)
+    finally:
+        alert_engine.requests.post = original
+
+
+def test_a_and_a_plus_are_still_delivered():
+    def body():
+        for grade in (Grade.A, Grade.A_PLUS):
+            engine = AlertEngine()
+            engine.process_decision(make_decision(Status.ENTRY, Direction.LONG, grade),
+                                    100, bar_start=BAR)
+            assert engine._delivery_thread is not None, f"{grade.value} not delivered"
+            engine.close(timeout=5)
+    original = _stub_post()
+    try:
+        _with_telegram_configured(body)
+    finally:
+        alert_engine.requests.post = original
+
+
+def test_error_alerts_are_not_grade_filtered():
+    """Error records carry grade=None; the filter applies to Trading alerts only."""
+    def body():
+        engine = AlertEngine()
+        engine.process_error("feed disconnected", 100)
+        assert engine._delivery_thread is not None
+        engine.close(timeout=5)
+    original = _stub_post()
+    try:
+        _with_telegram_configured(body)
+    finally:
+        alert_engine.requests.post = original
+
+
+def test_an_undelivered_b_still_starts_the_flip_cooldown():
+    """The filter sits after the latch and cooldown bookkeeping, so their
+    behaviour is unchanged: a B alert is still the cooldown's reference point."""
+    engine = AlertEngine()
+    t = datetime(2026, 8, 14, 10, 0, 0)
+    first = engine.process_decision(make_decision(Status.ENTRY, Direction.LONG, Grade.B),
+                                    100, now=t)
+    assert engine._last_alert is first
+    flip = engine.process_decision(make_decision(Status.ENTRY, Direction.SHORT, Grade.B),
+                                   99, now=t + timedelta(minutes=1))
+    assert flip is None, "a B flip inside the cooldown must still be withheld"
 
 
 def test_engine_version_covers_alert_engine():

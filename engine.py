@@ -112,6 +112,58 @@ def five_minute_start(value: datetime) -> datetime:
     return value.replace(minute=value.minute - value.minute % 5, second=0, microsecond=0)
 
 
+# 15-minute EMA20 — LOGGED ONLY, for the backtest comparison in
+# Markdowns/backtest_vwap_pullback_oct2026.md. Not in _VERSIONED_CONSTANTS and
+# never read by a rule, so neither moves engine behaviour.
+HTF_MINUTES = 15
+HTF_EMA_PERIOD = 20
+
+
+def fifteen_minute_start(value: datetime) -> datetime:
+    """15m bucket aligned to the 09:15 open: 09:15, 09:30, ... 15:15, 15:30."""
+    since_open = (value.hour * 60 + value.minute) - (config.MARKET_OPEN_HOUR * 60
+                                                     + config.MARKET_OPEN_MINUTE)
+    return (value - timedelta(minutes=since_open % HTF_MINUTES)).replace(second=0, microsecond=0)
+
+
+def ema20_15m_from_bars(bars) -> tuple:
+    """(ema, slope) at the last COMPLETED 15m bar, built from closed 5m bars.
+
+    A bucket's close is its last 5m bar's close. Every bucket except the newest
+    is complete by construction (a later bar exists); the newest counts only once
+    its third 5m bar has closed. Slope is EMA change per 15m bar. EMA runs
+    continuously across sessions, seeded from the first bucket's close.
+    """
+    closes, starts = [], []
+    for bar in bars:
+        bucket = fifteen_minute_start(bar.start)
+        if starts and starts[-1] == bucket:
+            closes[-1] = bar.close
+        else:
+            starts.append(bucket)
+            closes.append(bar.close)
+    if bars and bars[-1].start < starts[-1] + timedelta(minutes=HTF_MINUTES - 5):
+        closes.pop()  # newest bucket still forming
+    multiplier = 2 / (HTF_EMA_PERIOD + 1)
+    ema = prev = None
+    for close in closes:
+        prev = ema
+        ema = close if ema is None else (close - ema) * multiplier + ema
+    slope = (ema - prev) if (ema is not None and prev is not None) else None
+    return ema, slope
+
+
+def projected_volume_ratio(volume, sma20, elapsed) -> Optional[float]:
+    """The relative volume signal_engine._evaluate_volume compares, as a number.
+    Same formula and the same "too early" cut-off; a test pins the two together."""
+    if volume is None or not sma20:
+        return None
+    elapsed = config.BAR_SECONDS if elapsed is None else min(max(elapsed, 0.0), config.BAR_SECONDS)
+    if elapsed < config.VOLUME_PROJECTION_MIN_ELAPSED_SECONDS:
+        return None
+    return volume * (config.BAR_SECONDS / max(elapsed, 1.0)) / sma20
+
+
 def classify_oi_pattern(price_change: Optional[float], oi_change: Optional[float]) -> str:
     """Same four-state classification used in the Pine script's OI gate,
     so Python and Pine agree on what 'fresh conviction' looks like."""
@@ -234,6 +286,20 @@ class LiveFiveMinuteSession:
             self.completed_ema = bar.close if self.completed_ema is None else (
                 (bar.close - self.completed_ema) * multiplier + self.completed_ema
             )
+        self._update_logged_measures()
+
+    def _update_logged_measures(self):
+        """Logged-only values that change once per closed 5m bar. Recomputed on
+        close rather than per tick: neither can move while a bar is forming."""
+        history = list(self.seed) + list(self.completed)
+        self.ema20_15m, self.slope_15m = ema20_15m_from_bars(history)
+        # Final ratio of the last COMPLETED bar of today, against the 20 bars
+        # before it — the completed-bar ratio the backtest used. None until today
+        # has closed a bar: the last seed bar is yesterday's, not a candidate.
+        base = history[-(config.VOLUME_LOOKBACK_BARS + 1):-1]
+        self.vol_ratio_last_closed = (
+            self.completed[-1].volume / (sum(b.volume for b in base) / len(base))
+            if self.completed and base and sum(b.volume for b in base) else None)
 
     def _add_volume(self, volume: float, price: float):
         if volume > 0:
@@ -253,6 +319,7 @@ class LiveFiveMinuteSession:
             [bar.as_candle() for bar in self.completed],
             bin_size=self.bin_size, value_area_pct=self.value_area_pct,
         )
+        self._update_logged_measures()
 
     def apply_tick(self, price: float, cumulative_volume: float, oi: Optional[float], timestamp: datetime):
         """Every live tick updates price/volume/OI for the current forming bar."""
@@ -400,6 +467,7 @@ class LiveFiveMinuteSession:
                 elapsed_seconds = min(max(elapsed_seconds, 0.0), config.BAR_SECONDS)
             else:
                 elapsed_seconds = config.BAR_SECONDS
+            average_bar_volume = self._average_recent_volume(config.VOLUME_LOOKBACK_BARS)
             return {
                 "result": self.profile, "vwap": vwap, "ema_10": ema,
                 # EMA10 as it stood EMA_SLOPE_LOOKBACK_SECONDS ago; the Trend
@@ -411,7 +479,14 @@ class LiveFiveMinuteSession:
                 "current_price": self.last_price, "candle_count": len(self.completed),
                 "oi": current_oi, "previous_oi": previous_oi, "oi_pattern": oi_pattern,
                 "current_bar_volume": current_candle.volume if current_candle else None,
-                "average_bar_volume": self._average_recent_volume(config.VOLUME_LOOKBACK_BARS),
+                "average_bar_volume": average_bar_volume,
+                # Logged only — see IndicatorSnapshot.
+                "vol_ratio_projected": projected_volume_ratio(
+                    current_candle.volume if current_candle else None,
+                    average_bar_volume, elapsed_seconds),
+                "vol_ratio_last_closed": self.vol_ratio_last_closed,
+                "ema20_15m": self.ema20_15m,
+                "slope_15m": self.slope_15m,
                 # Still-forming candle as an immutable point-in-time copy —
                 # Pullback/Rejection need its OHLC, not just the latest price.
                 "current_candle": current_candle,
@@ -499,6 +574,20 @@ def measured_fields(candle, indicators) -> dict:
         # Same subtraction _evaluate_trend does; None until the lookback fills.
         "ema_slope": (ema10 - ema10_prev)
                      if (ema10 is not None and ema10_prev is not None) else None,
+        **logged_htf_fields(indicators),
+    }
+
+
+def logged_htf_fields(indicators) -> dict:
+    """The logged-only columns, shared by signal_log and alert_log so the two
+    files carry identical values for the same evaluation."""
+    slope = getattr(indicators, "slope_15m", None) if indicators else None
+    return {
+        "ema20_15m": getattr(indicators, "ema20_15m", None) if indicators else None,
+        "slope_15m": slope,
+        "slope_15m_dir": None if slope is None else (slope > 0) - (slope < 0),
+        "vol_ratio_projected": getattr(indicators, "vol_ratio_projected", None) if indicators else None,
+        "vol_ratio_last_closed": getattr(indicators, "vol_ratio_last_closed", None) if indicators else None,
     }
 
 
@@ -554,8 +643,9 @@ class SignalStateLog:
     # retuned from the log instead of reconstructed. high/low in particular are
     # unrecoverable afterwards: rows are written only on change, so ticks
     # between them are invisible and a bar's running extremes cannot be rebuilt.
-    # relative_volume is NOT here — it is derivable from bar_volume,
-    # sma20_volume and elapsed_seconds, which is verified by test.
+    # vol_ratio_projected duplicates what bar_volume, sma20_volume and
+    # elapsed_seconds already imply; it is logged as a number anyway so a
+    # threshold can be swept from one column (15 Oct 2026 decision).
     # bar_start is here, NOT in STATE_FIELDS, and it is what makes the near-miss
     # columns countable. Rows are written only on change, so a near-miss that
     # holds steady for four minutes writes one row while one oscillating near a
@@ -575,7 +665,9 @@ class SignalStateLog:
     # silently wrong on precisely those rows.
     MEASURED_FIELDS = ["bar_start", "current_price", "open", "high", "low", "close",
                        "bar_volume", "sma20_volume", "elapsed_seconds",
-                       "ema_10", "vwap", "ema_slope"]
+                       "ema_10", "vwap", "ema_slope",
+                       "ema20_15m", "slope_15m", "slope_15m_dir",
+                       "vol_ratio_projected", "vol_ratio_last_closed"]
     FIELDS = ["timestamp"] + STATE_FIELDS + MEASURED_FIELDS + ["engine_version"]
 
     def __init__(self, path: Optional[str] = None):
@@ -621,7 +713,9 @@ class SignalStateLog:
     def record(self, snapshot, decision, now: datetime, current_price=None,
                bar_volume=None, sma20_volume=None, elapsed_seconds=None,
                open_=None, high=None, low=None, ema_10=None, vwap=None,
-               ema_slope=None, bar_start=None, close=None) -> bool:
+               ema_slope=None, bar_start=None, close=None,
+               ema20_15m=None, slope_15m=None, slope_15m_dir=None,
+               vol_ratio_projected=None, vol_ratio_last_closed=None) -> bool:
         """Writes a row only if a state changed. Returns whether it wrote."""
         if snapshot is None or decision is None:
             return False
@@ -670,6 +764,11 @@ class SignalStateLog:
             "ema_10": ema_10,
             "vwap": vwap,
             "ema_slope": ema_slope,
+            "ema20_15m": ema20_15m,
+            "slope_15m": slope_15m,
+            "slope_15m_dir": slope_15m_dir,
+            "vol_ratio_projected": vol_ratio_projected,
+            "vol_ratio_last_closed": vol_ratio_last_closed,
             "engine_version": self._version,
         })
 

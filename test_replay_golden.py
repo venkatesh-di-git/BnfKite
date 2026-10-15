@@ -22,7 +22,8 @@ pytestmark = pytest.mark.skipif(
 
 
 PHASE1_VERSION = "b3620733"      # before the flip cooldown
-BASELINE = "fd8e6f05"            # + Telegram V2 formatter + startup alert
+PRE_B_FILTER_VERSION = "fd8e6f05"  # Telegram V2 formatter + startup alert
+BASELINE = "26695b63"            # + B log-only, + logged 15m EMA20 / vol ratios, 15 Oct 2026
 
 
 def test_engine_version_is_the_baseline():
@@ -62,6 +63,15 @@ def test_the_flip_cooldown_removed_exactly_one_alert_and_added_none():
     withheld = gone[0]
     assert withheld[0].endswith("09:56:44")
     assert (withheld[2], withheld[3]) == ("Long", "B")
+
+
+def test_the_b_filter_changed_delivery_and_nothing_logged():
+    """THE ACCEPTANCE TEST for 15 Oct's two changes: dropping B from Telegram,
+    and logging the 15m EMA20 and volume ratios. Neither may alter a grade, a
+    gate or an alert time, so the recorded alerts — B included — must be
+    identical to the version before them. Any diff here means one of them
+    leaked into the latch, the cooldown, the rules or the record."""
+    assert golden.diff(against=PRE_B_FILTER_VERSION) == ([], [])
 
 
 def test_cross_version_diff_must_be_asked_for_by_name():

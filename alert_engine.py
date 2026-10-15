@@ -21,7 +21,7 @@ import requests
 
 import config
 from decision_engine import Decision, Status
-from engine import engine_version, rotate_if_header_stale
+from engine import engine_version, logged_htf_fields, rotate_if_header_stale
 from telegram_format import (format_error_alert, format_startup_alert,
                              format_trading_alert)
 
@@ -68,8 +68,20 @@ FLIP_COOLDOWN_MINUTES = 5
 # cost of it catching under a quarter of flips.
 COOLDOWN_ESCAPING_GRADES = ("A", "A+")
 
-ALERT_LOG_FIELDS = ["id", "timestamp", "type", "direction", "grade", "confidence",
-                    "setup", "current_price", "reason_list", "engine_version"]
+# Grades that reach Telegram. Delivery only: every TRADING_GRADES alert is still
+# latched, cooldown-tracked and written to alert_log.csv with its grade, so B
+# stays in the analysis corpus. B was dropped from delivery 15 Oct 2026 (see
+# Markdowns/backtest_vwap_pullback_oct2026.md). Here rather than config.py for
+# the same reason as ALERT_GRADE_RANK: changing it should move engine_version.
+TELEGRAM_GRADES = ("A", "A+")
+
+# Logged-only columns, identical to signal_log's (engine.logged_htf_fields).
+LOGGED_HTF_FIELDS = ["ema20_15m", "slope_15m", "slope_15m_dir",
+                     "vol_ratio_projected", "vol_ratio_last_closed"]
+
+ALERT_LOG_FIELDS = (["id", "timestamp", "type", "direction", "grade", "confidence",
+                     "setup", "current_price", "reason_list"]
+                    + LOGGED_HTF_FIELDS + ["engine_version"])
 
 SUPPRESSED_LOG_FIELDS = ["timestamp", "direction", "grade", "setup", "current_price",
                          "seconds_since_last", "blocked_by_direction",
@@ -114,6 +126,8 @@ class AlertRecord:
     ema10: Optional[float] = None
     ema_slope: Optional[float] = None
     signals: Optional[object] = None
+    # LOGGED_HTF_FIELDS -> value. Written to alert_log.csv only; never read.
+    logged: dict = field(default_factory=dict)
 
     # --- Startup records only ---
     #
@@ -248,6 +262,7 @@ class AlertEngine:
             ema_slope=(ema10 - ema10_prev)
                       if (ema10 is not None and ema10_prev is not None) else None,
             signals=decision.signals,
+            logged=logged_htf_fields(indicators),
         )
         self._store(record)
         # Only DELIVERED alerts start a cooldown. A withheld one must not extend
@@ -407,6 +422,7 @@ class AlertEngine:
                 record.id, record.timestamp.isoformat(), record.type, record.direction,
                 record.grade, record.confidence, record.setup or "",
                 record.current_price, " | ".join(record.reason_list),
+                *[record.logged.get(name) for name in LOGGED_HTF_FIELDS],
                 # This file is what alerting policy gets scored against, and the
                 # latch changes alert counts by design. Rows written either side
                 # of that boundary are indistinguishable without this.
@@ -418,6 +434,9 @@ class AlertEngine:
         never performs the HTTP call on the caller's thread."""
         if not self.enable_telegram:
             logger.debug("Telegram disabled on this engine — not delivering alert %s", record.id)
+            return
+        if record.type == "Trading" and record.grade not in TELEGRAM_GRADES:
+            logger.debug("Grade %s is log-only — not delivering alert %s", record.grade, record.id)
             return
         if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
             logger.warning("Telegram not configured — skipping delivery for alert %s", record.id)

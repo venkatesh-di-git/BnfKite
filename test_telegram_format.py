@@ -293,12 +293,15 @@ def test_the_csv_stores_a_number_not_an_emoji_sentence():
 
 
 def test_the_alert_log_schema_is_unchanged():
-    """Adding a seed_count COLUMN would trip rotate_if_header_stale and rename the
-    VM's 57-row history out from under every study that reads alert_log.csv."""
+    """Any new column trips rotate_if_header_stale and renames the VM's history
+    out from under every study that reads alert_log.csv — so a schema change must
+    be deliberate. The 5 logged-only columns were added on purpose, 15 Oct 2026."""
     from alert_engine import ALERT_LOG_FIELDS
     assert ALERT_LOG_FIELDS == ["id", "timestamp", "type", "direction", "grade",
                                 "confidence", "setup", "current_price",
-                                "reason_list", "engine_version"]
+                                "reason_list", "ema20_15m", "slope_15m",
+                                "slope_15m_dir", "vol_ratio_projected",
+                                "vol_ratio_last_closed", "engine_version"]
 
 
 def test_a_low_seed_is_visible_in_both_the_csv_and_the_message():

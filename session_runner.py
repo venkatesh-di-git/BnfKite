@@ -258,6 +258,9 @@ class SessionRunner:
             current_oi=s.get("oi"), previous_oi=s.get("previous_oi"),
             poc=result.poc if result else None, vah=result.vah if result else None,
             val=result.val if result else None, elapsed_seconds=s.get("elapsed_seconds"),
+            ema20_15m=s.get("ema20_15m"), slope_15m=s.get("slope_15m"),
+            vol_ratio_projected=s.get("vol_ratio_projected"),
+            vol_ratio_last_closed=s.get("vol_ratio_last_closed"),
         )
         # The previous snapshot is what the hysteresis rules read to know which
         # side of a threshold they are already on — the engine stays stateless.
