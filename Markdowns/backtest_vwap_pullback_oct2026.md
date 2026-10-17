@@ -198,3 +198,31 @@ All on 5-min, stop 20 / target 30 unless stated. A = 20 trades, 60%, +120; A+ = 
 **Weakest links:** A+ on 8 trades, the 1-minute latency sensitivity, and selection from roughly 250 configurations tested today on the same 15 sessions.
 
 **Added to the month-end run:** report the latency check (entry at +0 / +1 / +2 min), the random-entry benchmark, and target 40 as a logged variant.
+
+---
+
+## Wider-sample check (17 Oct): Aug + Sep + Oct archives, rules unchanged
+
+**Engine:** `replay/bt_vwap_pullback.py`, a rebuild of the lost `claude/bt_vwap_pullback.py`. On Oct 1-15 it reproduces the A+ trade log above exactly. Run: `python -m replay.bt_vwap_pullback` (`--no-live` skips the live-engine replay).
+**Data:** 47 sessions across the three front-month contracts (29 Jul - 25 Aug, 2 - 25 Sep, 1 - 15 Oct). Each contract is run as its own series, with no EMA carried across a roll. 26-31 Aug and 28-29 Sep were never archived. Aug and Sep were not used to build the rules.
+
+**Result: the setup fails.** Stop 20 / target 30, net of 2 pts slippage each way.
+
+| Contract | A+ | A |
+|---|---|---|
+| Aug | 19 trades, 32%, -156 | 42, 24%, -508 |
+| Sep | 11 trades, 9%, -214 | 36, 22%, -464 |
+| Oct | 5 trades, 60%, +30 | 14, 57%, +64 |
+| **All** | **35 trades, 29%, avg -9.7, total -340** | **92, 28%, avg -9.9, total -908** |
+
+- Exits at target 25 / 40 and entry +1 / +2 min late all lose money too.
+- Candidate 1 (15m slope + vol >= 1.3x): 22 trades, 36%, -128. Candidate 2 (5m EMA10 slope sign + vol >= 1.0x): 45 trades, 33%, -347.
+- No trend filter at all: 160 trades, 32%, -1,307. This is near the random-entry benchmark, so the trigger shows no edge on the larger sample.
+- 15m EMA20 slope as a filter adds nothing (92 vs 160 trades: 28% vs 32%). Keep it logged only.
+- Only 5m EMA10 slope beyond +/-4.3 per min (the live threshold) is positive: 10 trades, 70%, +110. Too few to act on; log and watch.
+- Live engine replayed (531 trades, fixed 20/30 exit): A+ 42% / -370, A 39% / -1,034, B 31% / -1,460. Every grade loses.
+- Verdict against the pass criteria (win rate > 60% and avg >= +5): **not met.** The Oct result looks like an in-sample fit.
+
+**Decision (17 Oct):** no change to the engine, alerts, grades or playbook. Keep the logging-only changes from 15 Oct. Retest after about 15 more sessions (16 Oct onward) with the rules unchanged.
+
+**Before the retest (time-critical):** archive 16 - 27 Oct before BANKNIFTY26OCTFUT settles on 27 Oct, then archive the Nov contract from 28 Oct. A settled contract drops out of `kite.instruments` and its candles can no longer be fetched.
