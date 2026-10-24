@@ -33,6 +33,7 @@ import replay.bt_vwap_pullback as bt  # noqa: E402
 from replay.bt_vwap_pullback import CONTRACTS, load_days, signals, tradable  # noqa: E402
 
 CLUSTER_MIN = 30
+LAST_DAY = "2026-10-15"
 RNG = random.Random(7)
 BANDS = ((0, 0.8, "<0.8"), (0.8, 1.0, "0.8-1.0"), (1.0, 1.3, "1.0-1.3"), (1.3, 1e9, ">1.3"))
 
@@ -56,7 +57,9 @@ def build():
     U, series = [], {}
     for sym in CONTRACTS:
         days = load_days(sym)
-        td = tradable(sym, days)
+        # Pinned to the 17 Oct report window so its figures stay reproducible as
+        # the archive grows; later sessions belong to the forward test.
+        td = {d for d in tradable(sym, days) if d <= LAST_DAY}
         sigs, m1 = signals(days, td)
         idx = {r["t"]: n for n, r in enumerate(m1)}
         series[sym] = dict(td=td, m1=m1, idx=idx)
@@ -129,13 +132,30 @@ def boot(p, n=2000):
     return m[int(0.05 * n)], m[int(0.95 * n) - 1]
 
 
+def boot_sessions(tr, n=2000):
+    """90% interval of the mean, resampling whole SESSIONS: trades on one day are
+    correlated, so resampling trades understates the width (review, 24 Oct)."""
+    by = defaultdict(list)
+    for x in tr:
+        by[x["day"]].append(x["pts"])
+    days = list(by.values())
+    if len(days) < 2:
+        return None, None
+    m = []
+    for _ in range(n):
+        flat = [v for d in RNG.choices(days, k=len(days)) for v in d]
+        m.append(sum(flat) / len(flat))
+    m.sort()
+    return m[int(0.05 * n)], m[int(0.95 * n) - 1]
+
+
 def summ(tr, label, w=36):
     ind = independent(tr)
     if not ind:
         print(f"  {label:<{w}} raw {len(tr):3d} ind   0")
         return None
     p = [x["pts"] for x in ind]
-    lo, hi = boot(p)
+    lo, hi = boot_sessions(ind)
     by = defaultdict(float)
     for x in ind:
         by[x["day"]] += x["pts"]
@@ -356,10 +376,21 @@ def t_trendgate(series, cache):
         summ(run(series, [x for x in fired if f(x)]), f"FIRED    {lab}")
     print("  -- only blocked events NOT near a fired alert")
     summ(run(series, apart), "BLOCKED  (apart from fired)")
-    b = [x["pts"] for x in independent(run(series, blocked))]
-    f = [x["pts"] for x in independent(run(series, fired))]
-    d = sorted(sum(RNG.choices(b, k=len(b))) / len(b) - sum(RNG.choices(f, k=len(f))) / len(f)
-               for _ in range(2000))
+    bi, fi = independent(run(series, blocked)), independent(run(series, fired))
+    b, f = [x["pts"] for x in bi], [x["pts"] for x in fi]
+
+    def day_groups(tr):
+        g = defaultdict(list)
+        for x in tr:
+            g[x["day"]].append(x["pts"])
+        return list(g.values())
+
+    def mean_of(groups):
+        flat = [v for g in RNG.choices(groups, k=len(groups)) for v in g]
+        return sum(flat) / len(flat)
+
+    bg, fg = day_groups(bi), day_groups(fi)
+    d = sorted(mean_of(bg) - mean_of(fg) for _ in range(2000))
     print(f"  difference (blocked - fired) avg {sum(b) / len(b) - sum(f) / len(f):+.1f}, "
           f"90% CI [{d[100]:+.1f}, {d[1899]:+.1f}], blocked better in "
           f"{100 * sum(1 for v in d if v > 0) / len(d):.0f}% of resamples")
@@ -375,6 +406,62 @@ def book_pts(series, al):
         trades.append(sim(m1, it["i"], it["side"]))
         busy[it["day"]] = _exit_time(m1, it["i"], it["side"])
     return trades
+
+
+def slot_map(series):
+    slot = defaultdict(list)
+    for sym, S in series.items():
+        for n, r in enumerate(S["m1"]):
+            if f"{r['t']:%Y-%m-%d}" in S["td"] and r["t"].time() < bt.FORCED_EXIT:
+                slot[r["t"].hour * 60 + r["t"].minute].append((sym, n))
+    return slot
+
+
+def path(m1, i0, side, H):
+    """Best move for (mfe), worst move against (mae) and the move at the end of an
+    H-minute window from the entry open, in points, before costs. No exit at all."""
+    e = m1[i0]["open"]
+    end_t = m1[i0]["t"] + timedelta(minutes=H)
+    f = a = 0.0
+    last = e
+    for r in m1[i0:]:
+        if r["t"] >= end_t or r["t"].date() != m1[i0]["t"].date() or r["t"].time() >= bt.FORCED_EXIT:
+            break
+        hi_, lo_ = (r["high"] - e, e - r["low"]) if side > 0 else (e - r["low"], r["high"] - e)
+        f, a, last = max(f, hi_), max(a, lo_), r["close"]
+    return f, a, (last - e) * side
+
+
+def t_exitfree(series, U, L):
+    hdr("exit-free", "Best / worst move after entry, signals vs random entries (same side, same minute), no exit, no costs")
+    slot = slot_map(series)
+    for name, items in (("VWAP-pullback signals", U), ("A+ signals", [s for s in U if s["aplus"]]),
+                        ("live alerts, A/A+", [x for x in L if x["grade"] in ("A", "A+")]),
+                        ("live alerts, all grades", L)):
+        base = [x["it"] for x in independent(run(series, items))]
+        print(f"  --- {name}: {len(base)} independent entries")
+        print(f"      {'window':>6} | {'best for':>8} {'worst vs':>8} {'best-worst':>10} {'end move':>8} | "
+              f"random best-worst (90%)   end move (90%)   | signal beats random (best-worst / end)")
+        for H in (5, 15, 30):
+            sig = [path(series[s["sym"]]["m1"], s["i"], s["side"], H) for s in base]
+            sf, sa = sum(p[0] for p in sig) / len(sig), sum(p[1] for p in sig) / len(sig)
+            sd, se = sf - sa, sum(p[2] for p in sig) / len(sig)
+            rd, re_ = [], []
+            for _ in range(300):
+                rp = []
+                for s in base:
+                    sym, n = RNG.choice(slot[s["ct"].hour * 60 + s["ct"].minute] if "slope15" in s
+                                        else slot[series[s["sym"]]["m1"][s["i"]]["t"].hour * 60
+                                                  + series[s["sym"]]["m1"][s["i"]]["t"].minute])
+                    rp.append(path(series[sym]["m1"], n, s["side"], H))
+                rd.append(sum(p[0] - p[1] for p in rp) / len(rp))
+                re_.append(sum(p[2] for p in rp) / len(rp))
+            rd.sort()
+            re_.sort()
+            print(f"      {H:>4}m | {sf:>8.1f} {sa:>8.1f} {sd:>+10.1f} {se:>+8.1f} | "
+                  f"{sum(rd) / 300:>+6.1f} ({rd[15]:+5.1f}..{rd[284]:+5.1f})  {sum(re_) / 300:>+6.1f} "
+                  f"({re_[15]:+5.1f}..{re_[284]:+5.1f}) | "
+                  f"{100 * sum(1 for v in rd if v < sd) / 300:3.0f}% / {100 * sum(1 for v in re_ if v < se) / 300:3.0f}%")
 
 
 def t_slope(series, cache):
@@ -526,8 +613,11 @@ def main(argv):
     if want("6"): t6(series, U)
     if want("10"): t10(series, U)
     if want("5"): t5(series, U)
+    if want("exitfree"):
+        cache = replay_all(series, cache_path, (5,))
+        t_exitfree(series, U, live_items(series, cache[5]["alerts"]))
     if any(want(n) for n in ("11", "12", "cooldown")):
-        cache = replay_all(series, cache_path, (0, 3, 5, 10, 12, 15))
+        cache = replay_all(series, cache_path, (0, 3, 5, 10, 12, 15) if want("cooldown") else (5,))
         L = live_items(series, cache[5]["alerts"])
         if want("12"): t12(series, L)
         if want("11"): t11(series, cache[5]["near"], L)
